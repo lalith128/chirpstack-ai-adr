@@ -76,6 +76,23 @@ services:
     volumes: 
       - ./configuration/mosquitto/config/:/mosquitto/config/
 
+  adr-engine:
+    build:
+      context: ./adr_engine
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+    environment:
+      - MQTT_BROKER_HOST=mosquitto
+      - MQTT_BROKER_PORT=1883
+      - APPLICATION_ID=1
+      - CSV_OUTPUT_PATH=/app/data/phase1_transitions.csv
+    depends_on:
+      - mosquitto
+      - chirpstack
+
 volumes:
   postgresqldata:
   redisdata:
