@@ -78,8 +78,8 @@ services:
 
   adr-engine:
     build:
-      context: ./adr_engine
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: adr_engine/Dockerfile
     restart: unless-stopped
     volumes:
       - ./data:/app/data
