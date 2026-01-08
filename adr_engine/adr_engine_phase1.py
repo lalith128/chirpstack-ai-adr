@@ -185,7 +185,7 @@ class ADREngine:
     
     def _init_csv(self):
         """Initialize CSV file with header"""
-        df = pd.DataFrame(columns=['rssi', 'snr', 'temp', 'hum', 'pres', 'dr', 'tx', 'reward'])
+        df = pd.DataFrame(columns=['rssi', 'snr', 'temp', 'hum', 'pres', 'current_dr', 'current_tx', 'target_dr', 'target_tx', 'action_type', 'reward'])
         df.to_csv(CSV_OUTPUT_PATH, index=False)
         logger.info(f"Initialized CSV file: {CSV_OUTPUT_PATH}")
         self.csv_initialized = True
@@ -287,8 +287,23 @@ class ADREngine:
         except Exception as e:
             logger.error(f"Failed to publish downlink: {e}")
     
-    def log_to_csv(self, rssi, snr, temp, hum, pres, dr, tx, reward):
-        """Log transition to CSV file"""
+    def log_to_csv(self, rssi, snr, temp, hum, pres, current_dr, current_tx, target_dr, target_tx, action_type, reward):
+        """
+        Log transition to CSV file
+        
+        Args:
+            rssi: Received signal strength
+            snr: Signal-to-noise ratio
+            temp: Temperature from sensor
+            hum: Humidity from sensor
+            pres: Pressure from sensor
+            current_dr: Actual DR used by device (from txInfo)
+            current_tx: Estimated current TX power
+            target_dr: Target DR selected by exploration
+            target_tx: Target TX power selected by exploration
+            action_type: 'active_change' or 'passive_maintain'
+            reward: Calculated reward score
+        """
         try:
             row = {
                 'rssi': rssi,
@@ -296,20 +311,30 @@ class ADREngine:
                 'temp': temp,
                 'hum': hum,
                 'pres': pres,
-                'dr': dr,
-                'tx': tx,
+                'current_dr': current_dr,
+                'current_tx': current_tx,
+                'target_dr': target_dr,
+                'target_tx': target_tx,
+                'action_type': action_type,
                 'reward': reward
             }
             
             df = pd.DataFrame([row])
             df.to_csv(CSV_OUTPUT_PATH, mode='a', header=False, index=False)
             
-            logger.info(f"Logged to CSV: {row}")
+            logger.info(f"Logged to CSV [{action_type}]: current_dr={current_dr}, target_dr={target_dr}, reward={reward:.3f}")
         except Exception as e:
             logger.error(f"Failed to log to CSV: {e}")
+
     
     def process_uplink(self, msg_payload):
-        """Process uplink message and execute ADR logic"""
+        """
+        Process uplink message and execute ADR logic with hardened safeguards.
+        
+        Safeguards:
+        1. Stale State Handling: Extract actual DR from txInfo (not local state)
+        2. Duty Cycle Optimization: Only send downlink if DR/TX differs from current
+        """
         try:
             data = json.loads(msg_payload)
             
@@ -328,6 +353,46 @@ class ADREngine:
             rssi = rx_info[0].get('rssi', 0)
             snr = rx_info[0].get('snr', 0)
             
+            # ================================================================
+            # SAFEGUARD 1: Handle Stale State (Device Reboots)
+            # Extract actual DR from txInfo - DO NOT rely on local state
+            # ================================================================
+            tx_info = data.get('txInfo', {})
+            
+            # ChirpStack v4 JSON path: txInfo.modulation.lora.spreadingFactor
+            # or txInfo.dr (depending on version)
+            current_dr = None
+            
+            # Try to get DR directly
+            if 'dr' in tx_info:
+                current_dr = tx_info.get('dr')
+            elif 'dataRate' in tx_info:
+                current_dr = tx_info.get('dataRate')
+            
+            # Try to extract from modulation info (ChirpStack v4 format)
+            if current_dr is None:
+                modulation = tx_info.get('modulation', {})
+                lora_modulation = modulation.get('lora', {})
+                sf = lora_modulation.get('spreadingFactor')
+                if sf and sf in SF_TO_DR:
+                    current_dr = SF_TO_DR[sf]
+            
+            # Fallback: try to parse from the data rate index in other fields
+            if current_dr is None:
+                # Check in the root of the message
+                current_dr = data.get('dr', data.get('dataRate'))
+            
+            if current_dr is None:
+                logger.warning("Could not extract current DR from uplink, using default DR0 (SF12)")
+                current_dr = 0  # Safe fallback to SF12
+            
+            # Estimate current TX power (not directly available in uplink)
+            # Use a conservative estimate based on RSSI and typical path loss
+            # For now, assume TX_POWER_MAX as we can't know the actual TX power
+            current_tx = TX_POWER_MAX  # Conservative estimate
+            
+            logger.info(f"Extracted from txInfo: current_dr={current_dr} (SF{DR_TO_SF.get(current_dr, '?')})")
+            
             # Extract decoded object
             decoded_object = data.get('object', {})
             if not decoded_object:
@@ -339,32 +404,65 @@ class ADREngine:
             pres = decoded_object.get('pres', 0)
             
             logger.info(f"Received uplink from {dev_eui}: RSSI={rssi}, SNR={snr}, "
+                       f"DR={current_dr} (SF{DR_TO_SF.get(current_dr, '?')}), "
                        f"Temp={temp}, Hum={hum}, Pres={pres}")
             
-            # Exploration: pick a random action
-            dr, tx = self.explore_action()
+            # Exploration: pick a random target action
+            target_dr, target_tx = self.explore_action()
             
-            # Safety Shield: validate action
+            # Safety Shield: validate target action
             is_safe, predicted_snr = self.safety_shield.is_safe_action(
-                rssi, snr, temp, hum, pres, dr, tx
+                rssi, snr, temp, hum, pres, target_dr, target_tx
             )
             
             # If not safe, fallback to safest action
             if not is_safe:
-                logger.warning(f"Action DR={dr}, TX={tx} is not safe, falling back")
-                dr, tx = self.fallback_safe_action()
+                logger.warning(f"Action DR={target_dr}, TX={target_tx} is not safe, falling back")
+                target_dr, target_tx = self.fallback_safe_action()
             
-            # Calculate reward
-            reward = self.calculate_reward(dr, tx)
+            # Calculate reward based on TARGET settings (what we want to achieve)
+            reward = self.calculate_reward(target_dr, target_tx)
             
-            # Generate MAC command
-            mac_payload = self.generate_linkadr_req(dr, tx)
+            # ================================================================
+            # SAFEGUARD 2: Duty Cycle Optimization (Smart Exploration)
+            # Only send downlink if target differs from current
+            # ================================================================
+            dr_changed = (target_dr != current_dr)
+            tx_changed = (target_tx != current_tx)
+            settings_differ = dr_changed or tx_changed
             
-            # Publish downlink
-            self.publish_downlink(dev_eui, mac_payload)
+            if settings_differ:
+                # ACTIVE CHANGE: Target differs from current - send downlink
+                action_type = "active_change"
+                
+                # Generate MAC command
+                mac_payload = self.generate_linkadr_req(target_dr, target_tx)
+                
+                # Publish downlink
+                self.publish_downlink(dev_eui, mac_payload)
+                
+                logger.info(f"Active Change: DR {current_dr}->{target_dr}, TX {current_tx}->{target_tx}")
+            else:
+                # PASSIVE MAINTAIN: Current settings are optimal - skip downlink
+                action_type = "passive_maintain"
+                
+                logger.info(f"Passive Maintain: Current DR={current_dr}, TX={current_tx} matches target. "
+                           f"Skipping downlink to save airtime.")
             
-            # Log to CSV
-            self.log_to_csv(rssi, snr, temp, hum, pres, dr, tx, reward)
+            # ALWAYS log to CSV - both active changes and passive maintains are valid training data
+            self.log_to_csv(
+                rssi=rssi,
+                snr=snr,
+                temp=temp,
+                hum=hum,
+                pres=pres,
+                current_dr=current_dr,
+                current_tx=current_tx,
+                target_dr=target_dr,
+                target_tx=target_tx,
+                action_type=action_type,
+                reward=reward
+            )
             
         except json.JSONDecodeError as e:
             logger.error(f"Failed to parse JSON: {e}")
@@ -372,6 +470,7 @@ class ADREngine:
             logger.error(f"Missing key in message: {e}")
         except Exception as e:
             logger.error(f"Error processing uplink: {e}", exc_info=True)
+
 
 
 def on_connect(client, userdata, flags, rc):
