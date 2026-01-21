@@ -94,37 +94,82 @@ class SafetyShield:
         """
         Predict SNR for given context and action
         
+        The TFLite model expects 3 separate inputs:
+        - Context (5 features): [Prev_RSSI, Prev_SNR, PathLoss_Est, RSSI_Vol, SNR_Vol]
+        - Env (3 features): [Temp_BME, Hum_BME, Pres_BME]
+        - Action (13 features): One-Hot encoded [DR, TX]
+        
         Returns:
             tuple: (predicted_snr, uncertainty_sigma)
         """
         try:
-            # Prepare context features (current state)
-            # Assuming context = [rssi, snr, temp, hum, pres]
-            context = np.array([[rssi, snr, temp, hum, pres]], dtype=np.float32)
+            # ===== INPUT 1: CONTEXT (5 features) =====
+            # Training expects: ['Prev_RSSI', 'Prev_SNR', 'PathLoss_Est', 'RSSI_Vol', 'SNR_Vol']
+            # Since we don't maintain history, we approximate:
+            # - Use current RSSI/SNR as "previous"
+            # - Estimate PathLoss using simplified formula
+            # - Set volatility to 0 (no history available)
+            path_loss_est = -20 * np.log10(868e6 / 868e6) - 0.05 * hum
+            context = np.array([[rssi, snr, path_loss_est, 0.0, 0.0]], dtype=np.float32)
             context_scaled = self.scaler_context.transform(context)
             
-            # Prepare action features (DR, TX)
-            # Assuming action = [dr, tx]
-            action = np.array([[dr, tx]], dtype=np.float32)
+            # ===== INPUT 2: ENV (3 features) =====
+            # Training expects: ['Temp_BME', 'Hum_BME', 'Pres_BME']
+            env = np.array([[temp, hum, pres]], dtype=np.float32)
+            env_scaled = self.scaler_env.transform(env)
             
-            # Concatenate context and action
-            # Model input shape: [batch, context_dim + action_dim]
-            model_input = np.concatenate([context_scaled, action], axis=1).astype(np.float32)
+            # ===== INPUT 3: ACTION (13 features) =====
+            # Use the encoder to get One-Hot encoded DR + TX (13 total features)
+            raw_action = np.array([[dr, tx]])
+            
+            if self.encoder_action:
+                action_encoded = self.encoder_action.transform(raw_action)
+                # Handle sparse matrix if returned by encoder
+                if hasattr(action_encoded, "toarray"):
+                    action = action_encoded.toarray()
+                else:
+                    action = action_encoded
+                action = action.astype(np.float32)
+            else:
+                # Fallback if no encoder loaded
+                action = raw_action.astype(np.float32)
+            
+            # ===== SET 3 SEPARATE TENSORS =====
+            # From TFLite inspection:
+            # Input 0: Action [1, 13] - Index 0
+            # Input 1: Context [1, 5] - Index 1
+            # Input 2: Env [1, 3] - Index 2
+            self.interpreter.set_tensor(0, action)
+            self.interpreter.set_tensor(1, context_scaled)
+            self.interpreter.set_tensor(2, env_scaled)
             
             # Run inference
-            self.interpreter.set_tensor(self.input_details[0]['index'], model_input)
             self.interpreter.invoke()
             
-            # Get output (predicted SNR)
-            output = self.interpreter.get_tensor(self.output_details[0]['index'])
-            predicted_snr_scaled = output[0][0]
+            # ===== GET OUTPUTS =====
+            # From TFLite inspection:
+            # Output 0: Index 24, Shape [1, 2] - likely mu (predicted [RSSI, SNR])
+            # Output 1: Index 25, Shape [1, 2] - likely log_var (uncertainty)
+            mu_output = self.interpreter.get_tensor(24)
+            log_var_output = self.interpreter.get_tensor(25)
             
-            # Inverse transform to get actual SNR
-            predicted_snr = self.scaler_target.inverse_transform([[predicted_snr_scaled]])[0][0]
+            # Extract predicted SNR (index 1 in the [RSSI, SNR] pair)
+            predicted_snr_scaled = mu_output[0][1]
+            predicted_rssi_scaled = mu_output[0][0]
             
-            # Estimate uncertainty (simplified: use 2 dB as default sigma)
-            # In a real system, you'd have a separate uncertainty model
-            uncertainty_sigma = 2.0
+            # Inverse transform to get actual values
+            # scaler_target was fitted on [RSSI, SNR], so we reconstruct the pair
+            predicted_values_scaled = np.array([[predicted_rssi_scaled, predicted_snr_scaled]])
+            predicted_values = self.scaler_target.inverse_transform(predicted_values_scaled)
+            predicted_snr = predicted_values[0][1]
+            
+            # Estimate uncertainty from log_var output
+            # log_var is for [RSSI, SNR], SNR is index 1
+            log_var_snr = log_var_output[0][1]
+            uncertainty_sigma = np.exp(0.5 * log_var_snr)  # sigma = exp(0.5 * log_var)
+            # Scale uncertainty to actual SNR units
+            scale_factor = np.sqrt(self.scaler_target.var_[1])
+            uncertainty_sigma = uncertainty_sigma * scale_factor
             
             return predicted_snr, uncertainty_sigma
             
